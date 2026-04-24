@@ -1,0 +1,23 @@
+# .NET build output
+bin/
+obj/
+/packages/
+
+# Visual Studio / Rider
+.idea/
+*.user
+*.suo
+*.userprefs
+riderModule.iml
+/_ReSharper.Caches/
+
+# .NET user secrets (stored outside the repo in %APPDATA%, but guard against accidental copies)
+secrets.json
+
+# Environment files
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db

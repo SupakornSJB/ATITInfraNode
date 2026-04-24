@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+option csharp_namespace = "GameController";
+
+package game_controller;
+
+service GameControllerService {
+  rpc SendButtonEvent (ButtonEventRequest) returns (ButtonEventResponse);
+}
+
+message ButtonEventRequest {
+  string device_id  = 1;
+  string player_id  = 2;
+  string event_type = 3;
+  int64  timestamp  = 4;
+}
+
+message ButtonEventResponse {
+  bool   accepted = 1;
+  string message  = 2;
+}
