@@ -12,17 +12,23 @@ public class MqttSubscriberService : IHostedService
     private readonly IConfiguration _configuration;
     private readonly DeviceRegistryService _deviceRegistry;
     private readonly InputBufferService _inputBuffer;
+    private readonly UnityRelayService _unityRelay;
+    private readonly ZoneResolverService _zoneResolver;
     private readonly ILogger<MqttSubscriberService> _logger;
 
     public MqttSubscriberService(
         IConfiguration configuration,
         DeviceRegistryService deviceRegistry,
         InputBufferService inputBuffer,
+        UnityRelayService unityRelay,
+        ZoneResolverService zoneResolver,
         ILogger<MqttSubscriberService> logger)
     {
         _configuration = configuration;
         _deviceRegistry = deviceRegistry;
         _inputBuffer = inputBuffer;
+        _unityRelay = unityRelay;
+        _zoneResolver = zoneResolver;
         _logger = logger;
         _mqttClient = new MqttFactory().CreateMqttClient();
     }
@@ -102,21 +108,68 @@ public class MqttSubscriberService : IHostedService
             return;
         }
 
-        var normalizedValue = _deviceRegistry.NormalizeValue(entry, raw.Value);
+        switch (entry.InputRole)
+        {
+            case "environment":
+                await HandleEnvironmentEvent(entry, raw);
+                break;
 
-        var inputEvent = new InputEvent(
-            PlayerId: entry.PlayerId,
-            DeviceId: deviceId,
-            SlotId: slotId,
-            InputName: entry.InputName,
-            InputType: raw.InputType,
-            EventType: raw.Event,
-            Value: normalizedValue,
-            Timestamp: raw.Timestamp,
-            SequenceNumber: raw.SequenceNumber
-        );
+            case "stage":
+                var stageValue = _deviceRegistry.NormalizeValue(entry, raw.Value);
+                var stageEvent = new InputEvent(
+                    PlayerId: "stage",
+                    DeviceId: deviceId,
+                    SlotId: slotId,
+                    InputName: entry.InputName,
+                    InputType: raw.InputType,
+                    EventType: raw.Event,
+                    Value: stageValue,
+                    Timestamp: raw.Timestamp,
+                    SequenceNumber: raw.SequenceNumber
+                );
+                await _inputBuffer.EnqueueAsync(stageEvent);
+                break;
 
-        await _inputBuffer.EnqueueAsync(inputEvent);
+            default: // "player"
+                var playerValue = _deviceRegistry.NormalizeValue(entry, raw.Value);
+                var playerEvent = new InputEvent(
+                    PlayerId: entry.PlayerId!,
+                    DeviceId: deviceId,
+                    SlotId: slotId,
+                    InputName: entry.InputName,
+                    InputType: raw.InputType,
+                    EventType: raw.Event,
+                    Value: playerValue,
+                    Timestamp: raw.Timestamp,
+                    SequenceNumber: raw.SequenceNumber
+                );
+                await _inputBuffer.EnqueueAsync(playerEvent);
+                break;
+        }
+    }
+
+    private async Task HandleEnvironmentEvent(InputRegistryEntry entry, RawSlotPayload raw)
+    {
+        if (entry.EnvKey is null)
+        {
+            _logger.LogWarning("Environment input has no envKey configured: {InputName}", entry.InputName);
+            return;
+        }
+
+        float valueToSend = raw.Value;
+
+        if (entry.EnvKey == "ultrasonic_zone")
+        {
+            var zone = _zoneResolver.Resolve(raw.Value);
+            if (zone is null) return; // no zone change — suppress
+            valueToSend = zone.Value;
+        }
+
+        await _unityRelay.SendEnvironmentEvent(new EnvironmentEvent(
+            EnvKey: entry.EnvKey,
+            RawValue: valueToSend,
+            Timestamp: raw.Timestamp
+        ));
     }
 
     // Raw firmware payload — no semantic meaning, just physical slot data

@@ -19,12 +19,16 @@ public class InputConfig
     public string? PlayerId { get; init; }
     public float? MinRaw { get; init; }
     public float? MaxRaw { get; init; }
+    public string InputRole { get; init; } = "player";  // "player", "environment", "stage"
+    public string? EnvKey { get; init; }
 }
 
 public record InputRegistryEntry(
-    string PlayerId,
-    string InputName,   // semantic — forwarded to Unity
+    string? PlayerId,   // null for environment inputs
+    string InputName,
     string InputType,
     float? MinRaw,
-    float? MaxRaw
+    float? MaxRaw,
+    string InputRole,
+    string? EnvKey
 );

@@ -20,7 +20,7 @@ public class DeviceRegistryService
             return null;
 
         var playerId = input.PlayerId ?? device.DefaultPlayerId;
-        if (playerId is null)
+        if (playerId is null && input.InputRole == "player")
             return null;
 
         return new InputRegistryEntry(
@@ -28,7 +28,9 @@ public class DeviceRegistryService
             InputName: input.InputName,
             InputType: input.Type,
             MinRaw: input.MinRaw,
-            MaxRaw: input.MaxRaw
+            MaxRaw: input.MaxRaw,
+            InputRole: input.InputRole,
+            EnvKey: input.EnvKey
         );
     }
 

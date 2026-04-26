@@ -770,4 +770,267 @@ The gRPC proto does not change in Phase 2.1. Unity already receives `inputName`
 (semantic) and `playerId` — both of which are now correctly resolved server-side.
 `slotId` and `deviceId` are intentionally excluded from the proto; Unity has no
 use for physical device topology.
+
+
+# Phase 3 — Space Shooter: Environmental Routing, Zone Logic & Admin Commands
+
+## What Changed in Phase 3
+
+Phase 3 adds three server-side concerns:
+1. **Environmental input routing** — DHT11 and ultrasonic events have no `playerId`
+   and are forwarded to Unity via a new `SendEnvironmentEvent` RPC rather than `SendInputBatch`
+2. **Zone computation** — the server resolves raw ultrasonic distance into a discrete
+   zone ID with hysteresis before forwarding to Unity
+3. **Admin commands** — `SendAdminCommand` RPC added to the existing gRPC channel;
+   new REST endpoints allow external round control without a separate connection
+---
+
+## Architectural Decision: Environmental Inputs Are Not Player Inputs
+
+DHT11 temperature and ultrasonic distance have no `playerId` — they describe world
+state, not player actions. Routing them through `SendInputBatch` (which requires a
+`playerId`) would force an artificial player assignment. Instead they use a dedicated
+`SendEnvironmentEvent` RPC on the same gRPC channel. Unity routes them to
+`EnvironmentController` rather than `IoTInputManager`.
+
+This separation keeps the two concerns permanently distinct:
+- `SendInputBatch` → player input → `IoTInputManager` → player NetworkObjects
+- `SendEnvironmentEvent` → world state → `EnvironmentController` → `EnvironmentState`
+---
+
+## Phase 3 Proto Contract (Additive — No Breaking Changes)
+
+All Phase 2.1 RPCs unchanged. Three additions:
+
+```proto
+syntax = "proto3";
+ 
+option csharp_namespace = "GameController.V2";
+ 
+package game_controller.v2;
+ 
+service GameControllerService {
+  rpc SendInputEvent      (InputEventRequest)      returns (InputEventResponse);
+  rpc SendInputBatch      (InputBatchRequest)       returns (InputEventResponse);
+  rpc SendEnvironmentEvent(EnvironmentEventRequest) returns (InputEventResponse);  // new
+  rpc SendAdminCommand    (AdminCommandRequest)     returns (AdminCommandResponse); // new
+}
+ 
+// Unchanged from Phase 2.1
+message InputEventRequest { ... }
+message InputBatchRequest  { repeated InputEventRequest events = 1; }
+message InputEventResponse { bool accepted = 1; string message = 2; }
+ 
+// New — environmental world state update
+message EnvironmentEventRequest {
+  string env_key    = 1;  // "temperature" or "ultrasonic_zone"
+  float  raw_value  = 2;  // raw Celsius for temp; zone ID (1-4) for ultrasonic
+  int64  timestamp  = 3;
+}
+ 
+// New — admin round control
+message AdminCommandRequest {
+  string command   = 1;  // "start_round", "end_round", "reset"
+  string issued_by = 2;  // "admin", "system"
+  int64  timestamp = 3;
+}
+ 
+message AdminCommandResponse {
+  bool   accepted = 1;
+  string message  = 2;
+}
+```
+
+Update `server.csproj`:
+```xml
+<ItemGroup>
+  <Protobuf Include="Proto/game_controller_v2.proto" GrpcServices="Client"/>
+</ItemGroup>
+```
+ 
+---
+
+## Phase 3 Device Registry Schema Update
+
+New `inputRole` field per input entry: `"player"`, `"environment"`, or `"stage"`.
+The server uses this to route events to the correct RPC.
+
+```json
+{
+  "DeviceRegistry": {
+    "players": {
+      "player-1": ["esp32-ship-1"],
+      "player-2": ["esp32-ship-2"],
+      "player-3": ["esp32-bird-1"],
+      "player-4": ["esp32-bird-2"]
+    },
+    "devices": {
+      "esp32-ship-1": {
+        "defaultPlayerId": "player-1",
+        "inputs": {
+          "joystick-x":  { "type": "knob",   "inputName": "move-x", "inputRole": "player" },
+          "joystick-y":  { "type": "knob",   "inputName": "move-y", "inputRole": "player" },
+          "stick-click": { "type": "button", "inputName": "special", "inputRole": "player" },
+          "fire":        { "type": "button", "inputName": "fire",    "inputRole": "player" }
+        }
+      },
+      "esp32-ship-2": {
+        "defaultPlayerId": "player-2",
+        "inputs": {
+          "joystick-x":  { "type": "knob",   "inputName": "move-x", "inputRole": "player" },
+          "joystick-y":  { "type": "knob",   "inputName": "move-y", "inputRole": "player" },
+          "stick-click": { "type": "button", "inputName": "special", "inputRole": "player" },
+          "fire":        { "type": "button", "inputName": "fire",    "inputRole": "player" }
+        }
+      },
+      "esp32-bird-1": {
+        "defaultPlayerId": "player-3",
+        "inputs": {
+          "flap": { "type": "button", "inputName": "flap", "inputRole": "player" }
+        }
+      },
+      "esp32-bird-2": {
+        "defaultPlayerId": "player-4",
+        "inputs": {
+          "flap": { "type": "button", "inputName": "flap", "inputRole": "player" }
+        }
+      },
+      "esp32-stage": {
+        "defaultPlayerId": null,
+        "inputs": {
+          "temp":      { "type": "dht11",      "inputRole": "environment", "envKey": "temperature" },
+          "distance":  { "type": "ultrasonic", "inputRole": "environment", "envKey": "ultrasonic_zone" },
+          "pipe-flip": { "type": "button",     "inputRole": "stage",       "inputName": "pipe-flip" }
+        }
+      }
+    }
+  }
+}
+```
+
+`envKey` maps to the `env_key` field in `EnvironmentEventRequest`. Stage role inputs
+(`pipe-flip`) are forwarded as player inputs with `playerId: "stage"` — Unity's
+`IoTInputManager` routes `"stage"` player events to `StageController`.
+ 
+---
+
+## Phase 3 Zone Computation (`ZoneResolverService.cs`)
+
+Raw ultrasonic distance (cm) is resolved to a zone ID server-side before forwarding
+to Unity. Unity never receives raw distance values.
+
+### Zone definitions
+
+| Zone ID | Distance | Effect in Unity |
+|---|---|---|
+| 1 | 0–20cm | Shield bubble |
+| 2 | 20–60cm | Time slow (60% speed) |
+| 3 | 60–120cm | Normal — no effect |
+| 4 | 120cm+ | Enemy frenzy |
+
+### Hysteresis logic
+
+To prevent zone flickering at boundaries, a zone transition only commits after the
+reading has been consistently in the new zone for `HysteresisMs` (default: 500ms):
+
+```csharp
+public class ZoneResolverService
+{
+    private int   _currentZone       = 3;
+    private int   _candidateZone     = 3;
+    private long  _candidateSince    = 0;
+    private const int HysteresisMs   = 500;
+ 
+    public int? Resolve(float distanceCm)
+    {
+        int raw = distanceCm switch {
+            < 20  => 1,
+            < 60  => 2,
+            < 120 => 3,
+            _     => 4
+        };
+ 
+        if (raw == _currentZone) { _candidateZone = raw; return null; }
+ 
+        if (raw != _candidateZone) {
+            _candidateZone  = raw;
+            _candidateSince = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            return null;
+        }
+ 
+        long elapsed = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - _candidateSince;
+        if (elapsed < HysteresisMs) return null;
+ 
+        _currentZone = raw;
+        return _currentZone;  // non-null = zone changed, forward to Unity
+    }
+}
+```
+
+Only forward to Unity when zone actually changes — not on every ultrasonic reading.
+ 
+---
+
+## Phase 3 Event Routing Pipeline
+
+`MqttSubscriberService` now branches on `inputRole` after registry resolution:
+
+```
+Incoming MQTT event
+      ↓
+DeviceRegistryService.ResolveInput(deviceId, slotId)
+      → InputRegistryEntry { inputRole, inputName, playerId, envKey, ... }
+      ↓
+Branch on inputRole:
+ 
+  "player"      → InputBufferService.EnqueueAsync()
+                       → SendInputBatch (existing)
+ 
+  "environment" → if envKey == "ultrasonic_zone":
+                       ZoneResolverService.Resolve(value)
+                       if zone changed → UnityRelayService.SendEnvironmentEvent()
+                  if envKey == "temperature":
+                       UnityRelayService.SendEnvironmentEvent() directly
+ 
+  "stage"       → InputBufferService.EnqueueAsync() with playerId = "stage"
+                       → SendInputBatch (existing, Unity routes by playerId)
+```
+ 
+---
+
+## Phase 3 Admin Endpoints
+
+Three new minimal API endpoints. All call `UnityRelayService.SendAdminCommand()`
+over the **existing gRPC channel** — no new connection, no new protocol.
+
+```csharp
+app.MapPost("/api/admin/start",  () => relay.SendAdminCommand("start_round",  "admin"));
+app.MapPost("/api/admin/end",    () => relay.SendAdminCommand("end_round",    "admin"));
+app.MapPost("/api/admin/reset",  () => relay.SendAdminCommand("reset",        "admin"));
+```
+
+These endpoints require no auth for the POC (add API key header in production).
+They are the fallback round trigger mechanism — primary trigger is player ready-up
+via physical button press.
+ 
+---
+
+## Phase 3 Project Structure Changes
+
+```
+server/
+├── Services/
+│   ├── MqttSubscriberService.cs    # Updated: branches on inputRole
+│   ├── DeviceRegistryService.cs    # Updated: resolves inputRole + envKey
+│   ├── ZoneResolverService.cs      # New: hysteresis zone computation
+│   ├── InputBufferService.cs       # Unchanged
+│   └── UnityRelayService.cs        # Updated: SendEnvironmentEvent + SendAdminCommand
+├── Models/
+│   ├── InputEvent.cs               # Unchanged
+│   ├── EnvironmentEvent.cs         # New: { EnvKey, RawValue, Timestamp }
+│   └── DeviceRegistryConfig.cs     # Updated: inputRole + envKey fields
+└── Endpoints/
+    ├── IoTGameEndpoints.cs         # Updated: /health, /sessions
+    └── AdminEndpoints.cs           # New: /api/admin/start|end|reset
+```
  
