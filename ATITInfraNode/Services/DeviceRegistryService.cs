@@ -30,7 +30,8 @@ public class DeviceRegistryService
             MinRaw: input.MinRaw,
             MaxRaw: input.MaxRaw,
             InputRole: input.InputRole,
-            EnvKey: input.EnvKey
+            EnvKey: input.EnvKey,
+            AuxiliaryKeys: input.AuxiliaryKeys
         );
     }
 

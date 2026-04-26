@@ -21,6 +21,7 @@ public class InputConfig
     public float? MaxRaw { get; init; }
     public string InputRole { get; init; } = "player";  // "player", "environment", "stage"
     public string? EnvKey { get; init; }
+    public Dictionary<string, string> AuxiliaryKeys { get; init; } = new();  // payload key → envKey
 }
 
 public record InputRegistryEntry(
@@ -30,5 +31,6 @@ public record InputRegistryEntry(
     float? MinRaw,
     float? MaxRaw,
     string InputRole,
-    string? EnvKey
+    string? EnvKey,
+    Dictionary<string, string> AuxiliaryKeys
 );

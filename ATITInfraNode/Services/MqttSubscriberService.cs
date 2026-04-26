@@ -125,7 +125,8 @@ public class MqttSubscriberService : IHostedService
                     EventType: raw.Event,
                     Value: stageValue,
                     Timestamp: raw.Timestamp,
-                    SequenceNumber: raw.SequenceNumber
+                    SequenceNumber: raw.SequenceNumber,
+                    Auxiliary: raw.Auxiliary ?? new()
                 );
                 await _inputBuffer.EnqueueAsync(stageEvent);
                 break;
@@ -141,7 +142,8 @@ public class MqttSubscriberService : IHostedService
                     EventType: raw.Event,
                     Value: playerValue,
                     Timestamp: raw.Timestamp,
-                    SequenceNumber: raw.SequenceNumber
+                    SequenceNumber: raw.SequenceNumber,
+                    Auxiliary: raw.Auxiliary ?? new()
                 );
                 await _inputBuffer.EnqueueAsync(playerEvent);
                 break;
@@ -170,6 +172,22 @@ public class MqttSubscriberService : IHostedService
             RawValue: valueToSend,
             Timestamp: raw.Timestamp
         ));
+
+        // Forward each auxiliary reading as its own environment event
+        if (raw.Auxiliary is null) return;
+        foreach (var (payloadKey, auxValue) in raw.Auxiliary)
+        {
+            if (!entry.AuxiliaryKeys.TryGetValue(payloadKey, out var auxEnvKey))
+            {
+                _logger.LogDebug("Unknown auxiliary key '{Key}' on {DeviceId}/{SlotId} — ignored", payloadKey, raw.DeviceId, raw.SlotId);
+                continue;
+            }
+            await _unityRelay.SendEnvironmentEvent(new EnvironmentEvent(
+                EnvKey: auxEnvKey,
+                RawValue: auxValue,
+                Timestamp: raw.Timestamp
+            ));
+        }
     }
 
     // Raw firmware payload — no semantic meaning, just physical slot data
@@ -180,6 +198,7 @@ public class MqttSubscriberService : IHostedService
         string Event,
         float Value,
         long Timestamp,
-        long SequenceNumber
+        long SequenceNumber,
+        Dictionary<string, float>? Auxiliary = null
     );
 }

@@ -88,6 +88,8 @@ public class InputBufferService : IHostedService, IAsyncDisposable
             Timestamp = evt.Timestamp,
             SequenceNumber = evt.SequenceNumber
         };
+        if (evt.Auxiliary.Count > 0)
+            request.Auxiliary.Add(evt.Auxiliary);
 
         if (_bufferWindowMs == 0)
         {

@@ -12,14 +12,15 @@ service GameControllerService {
 }
 
 message InputEventRequest {
-  string player_id       = 1;
-  string device_id       = 2;
-  string input_name      = 3;
-  string input_type      = 4;
-  string event_type      = 5;
-  float  value           = 6;
-  int64  timestamp       = 7;
-  int64  sequence_number = 8;
+  string player_id             = 1;
+  string device_id             = 2;
+  string input_name            = 3;
+  string input_type            = 4;
+  string event_type            = 5;
+  float  value                 = 6;
+  int64  timestamp             = 7;
+  int64  sequence_number       = 8;
+  map<string, float> auxiliary = 9;  // reserved — for future multi-value slots
 }
 
 message InputBatchRequest {
@@ -32,15 +33,17 @@ message InputEventResponse {
 }
 
 message EnvironmentEventRequest {
-  string env_key    = 1;
-  float  raw_value  = 2;
-  int64  timestamp  = 3;
+  string env_key               = 1;
+  float  raw_value             = 2;
+  int64  timestamp             = 3;
+  map<string, float> auxiliary = 4;  // active — e.g. DHT11 humidity alongside temperature
 }
 
 message AdminCommandRequest {
-  string command   = 1;
-  string issued_by = 2;
-  int64  timestamp = 3;
+  string command               = 1;
+  string issued_by             = 2;
+  int64  timestamp             = 3;
+  map<string, float> auxiliary = 4;  // reserved — prefer typed fields for command params
 }
 
 message AdminCommandResponse {
