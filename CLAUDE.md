@@ -7,6 +7,7 @@ Read the relevant date file for context on recent changes before diving into cod
 
 - [2026-04-24](updates/2026-04-24.md) — MQTT TLS/port mismatch crash on startup
 - [2026-04-25](updates/2026-04-25.md) — Phase 2 (multi-input/device/player), gRPC SSL fix, logging, Phase 2.1 slot/inputName separation
+- [2026-04-27](updates/2026-04-27.md) — Phase 3 (environment routing, zone logic, admin commands), Phase 3.1 (auxiliary multi-output sensors), Phase 3.2 (swap gravity/spawn_rate effects)
 - [2026-04-27](updates/2026-04-27.md) — Phase 3.3 gRPC keep-alive/reconnection, Phase 4 library foundation (IoTGame.Core + GameServer)
 
 ## What This Project Is
@@ -1034,6 +1035,247 @@ server/
     ├── IoTGameEndpoints.cs         # Updated: /health, /sessions
     └── AdminEndpoints.cs           # New: /api/admin/start|end|reset
 ```
+ 
+---
+
+# Phase 3.1 — Protocol Fix: Auxiliary Field for Multi-Output Sensors
+
+## What Changed in Phase 3.1
+
+Phase 3 discarded DHT11 humidity because the payload had no place for a second
+value from one slot. Phase 3.1 adds an optional `auxiliary` map to all three
+gRPC message types — `InputEventRequest`, `EnvironmentEventRequest`, and
+`AdminCommandRequest`. This is an additive, non-breaking change.
+ 
+---
+
+## Architectural Decision: One `auxiliary` Convention Across All Messages
+
+All three message types get `auxiliary` for consistency and defensive design.
+Usage convention differs per message type:
+
+| Message | `auxiliary` use |
+|---|---|
+| `InputEventRequest` | Reserved — no current player hardware produces multiple simultaneous values from one slot |
+| `EnvironmentEventRequest` | Active use — DHT11 humidity alongside temperature primary value |
+| `AdminCommandRequest` | Reserved — if command parameters ever needed, prefer explicit typed fields over `auxiliary` |
+
+> **Rule:** `auxiliary` is for sensor overflow (one physical read, multiple values).
+> It is never required by receivers. Senders omit it when not applicable.
+ 
+---
+
+## Phase 3.1 Proto Update (Additive — No Breaking Change)
+
+`auxiliary` added as field 9 on `InputEventRequest`, field 4 on
+`EnvironmentEventRequest`, field 4 on `AdminCommandRequest`.
+Proto maps are optional by default — no existing code breaks.
+
+```proto
+syntax = "proto3";
+ 
+option csharp_namespace = "GameController.V2";
+ 
+package game_controller.v2;
+ 
+service GameControllerService {
+  rpc SendInputEvent       (InputEventRequest)       returns (InputEventResponse);
+  rpc SendInputBatch       (InputBatchRequest)        returns (InputEventResponse);
+  rpc SendEnvironmentEvent (EnvironmentEventRequest)  returns (InputEventResponse);
+  rpc SendAdminCommand     (AdminCommandRequest)      returns (AdminCommandResponse);
+}
+ 
+message InputEventRequest {
+  string player_id             = 1;
+  string device_id             = 2;
+  string input_name            = 3;
+  string input_type            = 4;
+  string event_type            = 5;
+  float  value                 = 6;
+  int64  timestamp             = 7;
+  int64  sequence_number       = 8;
+  map<string, float> auxiliary = 9;  // optional — reserved for future use
+}
+ 
+message InputBatchRequest {
+  repeated InputEventRequest events = 1;
+}
+ 
+message EnvironmentEventRequest {
+  string env_key               = 1;
+  float  raw_value             = 2;
+  int64  timestamp             = 3;
+  map<string, float> auxiliary = 4;  // active use — e.g. DHT11 humidity
+}
+ 
+message AdminCommandRequest {
+  string command               = 1;
+  string issued_by             = 2;
+  int64  timestamp             = 3;
+  map<string, float> auxiliary = 4;  // reserved — prefer typed fields for params
+}
+ 
+message InputEventResponse  { bool accepted = 1; string message = 2; }
+message AdminCommandResponse { bool accepted = 1; string message = 2; }
+```
+
+Regenerate stubs in both this project and the Unity project after applying.
+ 
+---
+
+## Phase 3.1 DHT11 Routing Update (`MqttSubscriberService.cs`)
+
+When an environment event arrives from a DHT11 slot, unpack both `value`
+(temperature) and `auxiliary["humidity"]` and forward as two separate
+`SendEnvironmentEvent` calls — one per reading:
+
+```csharp
+async Task RouteEnvironmentEvent(InputEvent evt)
+{
+    // Always forward primary value
+    await _relay.SendEnvironmentEvent(new EnvironmentEventRequest {
+        EnvKey   = evt.EnvKey,       // "temperature"
+        RawValue = evt.Value,
+        Timestamp = evt.Timestamp
+    });
+ 
+    // Forward each auxiliary value if present
+    foreach (var (key, val) in evt.Auxiliary)
+    {
+        string? envKey = ResolveAuxiliaryEnvKey(evt.DeviceId, evt.SlotId, key);
+        if (envKey == null) continue;
+ 
+        await _relay.SendEnvironmentEvent(new EnvironmentEventRequest {
+            EnvKey    = envKey,   // "humidity"
+            RawValue  = val,
+            Timestamp = evt.Timestamp
+        });
+    }
+}
+```
+
+`ResolveAuxiliaryEnvKey()` looks up the auxiliary key mapping from the device
+registry. Registry entry for DHT11 slot now includes an `auxiliaryKeys` map:
+
+```json
+"dht11": {
+  "type": "dht11",
+  "inputRole": "environment",
+  "envKey": "temperature",
+  "auxiliaryKeys": {
+    "humidity": "humidity"
+  }
+}
+```
+
+Unknown auxiliary keys are silently ignored — logged at Debug level only.
+ 
+---
+
+## Phase 3.1 `InputEvent.cs` Model Update
+
+```csharp
+public record InputEvent(
+    string PlayerId,
+    string DeviceId,
+    string SlotId,
+    string InputName,
+    string InputType,
+    string EventType,
+    float  Value,
+    long   Timestamp,
+    long   SequenceNumber,
+    Dictionary<string, float> Auxiliary  // new — empty dict if not present
+);
+```
+
+Deserialize `auxiliary` from MQTT payload in `MqttSubscriberService`:
+
+```csharp
+var auxiliary = payload.TryGetProperty("auxiliary", out var aux)
+    ? aux.Deserialize<Dictionary<string, float>>() ?? new()
+    : new Dictionary<string, float>();
+```
+ 
+---
+
+## Phase 3.1 Device Registry Schema Update
+
+DHT11 registry entry adds `auxiliaryKeys` mapping auxiliary payload keys
+to `envKey` values forwarded to Unity:
+
+```json
+"esp32-stage": {
+  "defaultPlayerId": null,
+  "inputs": {
+    "dht11": {
+      "type": "dht11",
+      "inputRole": "environment",
+      "envKey": "temperature",
+      "auxiliaryKeys": {
+        "humidity": "humidity"
+      }
+    },
+    "distance":  { "type": "ultrasonic", "inputRole": "environment", "envKey": "ultrasonic_zone" },
+    "pipe-flip": { "type": "button",     "inputRole": "stage",       "inputName": "pipe-flip" }
+  }
+}
+```
+---
+
+# Phase 3.2 — Design Fix: Swap Temperature and Humidity Effects
+
+## What Changed in Phase 3.2
+
+DHT11 hardware observation during testing revealed that temperature changes very
+slowly (10–30 seconds) while humidity responds within 2–3 seconds. The Phase 3
+effect assignment was therefore backwards for a real-time demo context.
+
+**Corrected assignment:**
+
+| Sensor | Phase 3 (wrong) | Phase 3.2 (correct) |
+|---|---|---|
+| Temperature | Spawn rate | Gravity strength |
+| Humidity | Nothing | Spawn rate |
+
+No protocol changes. No firmware changes. The fix is entirely in how the server
+labels and routes the two readings to Unity.
+ 
+---
+
+## Phase 3.2 Registry Update
+
+The `envKey` values in the DHT11 registry entry are updated to reflect the
+corrected semantic mapping. The server routes temperature to `"gravity"` and
+humidity to `"spawn_rate"`:
+
+```json
+"dht11": {
+  "type": "dht11",
+  "inputRole": "environment",
+  "envKey": "gravity",
+  "auxiliaryKeys": {
+    "humidity": "spawn_rate"
+  }
+}
+```
+
+Previously `envKey` was `"temperature"` and `auxiliaryKeys.humidity` was
+`"humidity"`. Both are renamed to their game-semantic equivalents so Unity
+receives self-describing keys rather than raw sensor names.
+ 
+---
+
+## Architectural Note: envKey Is Semantic, Not Physical
+
+This change reinforces the existing architectural principle — the server
+translates physical sensor identity into game semantic meaning. The Unity
+`EnvironmentController` should never need to know that `"spawn_rate"` comes
+from a humidity reading or that `"gravity"` comes from temperature. It just
+receives `envKey` values and applies effects.
+
+If the hardware were swapped (e.g. a different sensor used for spawn rate
+control), only the registry `envKey` mapping changes — Unity is unaffected.
 
 ---
 

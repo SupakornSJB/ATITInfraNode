@@ -10,5 +10,6 @@ public record InputEvent(
     string EventType,
     float  Value,           // normalized if knob
     long   Timestamp,
-    long   SequenceNumber
+    long   SequenceNumber,
+    Dictionary<string, float> Auxiliary  // extra sensor readings from same physical read
 );
