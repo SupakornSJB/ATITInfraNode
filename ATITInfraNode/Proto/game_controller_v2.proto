@@ -38,9 +38,10 @@ message EnvironmentEventRequest {
 }
 
 message AdminCommandRequest {
-  string command   = 1;
-  string issued_by = 2;
-  int64  timestamp = 3;
+  string             command   = 1;
+  string             issued_by = 2;
+  int64              timestamp = 3;
+  map<string, float> auxiliary = 4;
 }
 
 message AdminCommandResponse {

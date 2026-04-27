@@ -7,6 +7,7 @@ Read the relevant date file for context on recent changes before diving into cod
 
 - [2026-04-24](updates/2026-04-24.md) — MQTT TLS/port mismatch crash on startup
 - [2026-04-25](updates/2026-04-25.md) — Phase 2 (multi-input/device/player), gRPC SSL fix, logging, Phase 2.1 slot/inputName separation
+- [2026-04-27](updates/2026-04-27.md) — Phase 3.3 gRPC keep-alive/reconnection, Phase 4 library foundation (IoTGame.Core + GameServer)
 
 ## What This Project Is
 
@@ -1033,4 +1034,523 @@ server/
     ├── IoTGameEndpoints.cs         # Updated: /health, /sessions
     └── AdminEndpoints.cs           # New: /api/admin/start|end|reset
 ```
+
+---
+
+# Phase 3.3 — Infrastructure Fix: gRPC Connection Stability
+
+## What Changed in Phase 3.3
+
+Long-lived gRPC channels between ASP.NET and Unity can drop silently due to
+network hiccups, Unity server restarts, or cloud load balancer idle timeouts.
+Phase 3.3 adds keep-alive pings and reconnection logic to `UnityRelayService`
+so the channel recovers automatically without manual intervention.
  
+---
+
+## Keep-Alive Configuration
+
+Configure `SocketsHttpHandler` when building the gRPC channel in
+`UnityRelayService`. Keep-alive pings prevent idle timeout drops from
+intermediate network equipment (load balancers typically kill idle connections
+after 60–300 seconds):
+
+```csharp
+private GrpcChannel BuildChannel(string endpoint) =>
+    GrpcChannel.ForAddress(endpoint, new GrpcChannelOptions {
+        HttpHandler = new SocketsHttpHandler {
+            KeepAlivePingDelay    = TimeSpan.FromSeconds(30),
+            KeepAlivePingTimeout  = TimeSpan.FromSeconds(10),
+            EnableMultipleHttp2Connections = true
+        }
+    });
+```
+
+Every 30 seconds the client sends an HTTP/2 PING frame. If no response within
+10 seconds, the connection is considered dead and the reconnection logic takes
+over. Kestrel on the Unity side responds to PING frames automatically — no
+Unity-side configuration needed.
+ 
+---
+
+## Reconnection Logic (`UnityRelayService.cs`)
+
+Check `ConnectivityState` before every RPC call. Rebuild the channel if it is
+in `TransientFailure` or `Shutdown` state:
+
+```csharp
+public class UnityRelayService
+{
+    private GrpcChannel _channel;
+    private GameControllerService.GameControllerServiceClient _client;
+    private readonly string _endpoint;
+ 
+    public UnityRelayService(string endpoint)
+    {
+        _endpoint = endpoint;
+        _channel  = BuildChannel(endpoint);
+        _client   = new GameControllerServiceClient(_channel);
+    }
+ 
+    private async Task EnsureConnectedAsync()
+    {
+        var state = _channel.State;
+        if (state is ConnectivityState.TransientFailure or ConnectivityState.Shutdown)
+        {
+            _logger.LogWarning("[gRPC] Channel in {State} — rebuilding", state);
+            await _channel.ShutdownAsync();
+            _channel = BuildChannel(_endpoint);
+            _client  = new GameControllerServiceClient(_channel);
+        }
+    }
+ 
+    public async Task SendInputBatch(IEnumerable<InputEventRequest> events)
+    {
+        await EnsureConnectedAsync();
+        try
+        {
+            await _client.SendInputBatchAsync(new InputBatchRequest {
+                Events = { events }
+            });
+        }
+        catch (RpcException ex)
+        {
+            _logger.LogError("[gRPC] SendInputBatch failed: {Status}", ex.Status);
+            // do not throw — drop and continue
+        }
+    }
+ 
+    // Same pattern for SendEnvironmentEvent and SendAdminCommand
+}
+```
+
+`EnsureConnectedAsync()` is called at the top of every public method.
+The channel rebuild is lightweight — HTTP/2 connection re-establishment happens
+on the first RPC call after rebuild, not during `BuildChannel()` itself.
+ 
+---
+
+## gRPC Connectivity States Reference
+
+| State | Meaning | Action |
+|---|---|---|
+| `Idle` | Connected, no active calls | Normal — proceed |
+| `Connecting` | Establishing connection | Normal — proceed, gRPC queues the call |
+| `Ready` | Connected and healthy | Normal — proceed |
+| `TransientFailure` | Connection lost, retrying | Rebuild channel |
+| `Shutdown` | Channel explicitly closed | Rebuild channel |
+
+ 
+---
+ 
+---
+
+# Phase 4 — Library Foundation
+
+## What Changed in Phase 4
+
+Phase 4 restructures the ASP.NET server into a clear library/game separation,
+formalises the three developer interfaces, adds session management with a
+swappable storage backend, and closes authentication gaps identified in Phase 3.
+ 
+---
+
+## Architectural Decision: Source Library
+
+The server is distributed as a **source library** — developers clone the repo
+and write their game-specific code in `GameServer/`. The `IoTGame.Core/` project
+is the library and should not be modified. Developers reference it as a project
+reference, not a NuGet package.
+
+```
+Clone repo
+  → implement interfaces in GameServer/
+  → configure appsettings.json
+  → dotnet run --project GameServer
+```
+ 
+---
+
+## Phase 4 Folder Structure
+
+```
+iotgame-server/
+├── IoTGame.Core/                              ← LIBRARY — do not modify
+│   ├── IoTGame.Core.csproj
+│   ├── Abstractions/
+│   │   ├── IDeviceAuthenticator.cs
+│   │   ├── ISessionResolver.cs
+│   │   ├── IPlayerMapper.cs
+│   │   ├── ISessionStore.cs
+│   │   └── IAdminAuthenticator.cs
+│   ├── Services/
+│   │   ├── MqttSubscriberService.cs
+│   │   ├── InputBufferService.cs
+│   │   ├── ZoneResolverService.cs
+│   │   ├── UnityRelayService.cs
+│   │   └── SessionManager.cs
+│   ├── Storage/
+│   │   └── InMemorySessionStore.cs            ← default, ships with library
+│   ├── Auth/
+│   │   ├── AllowAllDeviceAuthenticator.cs     ← default
+│   │   ├── ApiKeyAdminAuthenticator.cs        ← default
+│   │   └── SessionTokenService.cs             ← optional token flow
+│   ├── Endpoints/
+│   │   ├── IoTGameEndpoints.cs                ← /health
+│   │   ├── AdminEndpoints.cs                  ← /api/admin/*
+│   │   └── SessionEndpoints.cs                ← /api/sessions/*
+│   ├── Models/
+│   │   ├── GameSession.cs
+│   │   ├── SessionConfig.cs
+│   │   ├── DeviceConfig.cs
+│   │   ├── SlotConfig.cs
+│   │   └── PlayerMapping.cs
+│   ├── Proto/
+│   │   └── game_controller_v2.proto
+│   └── Extensions/
+│       └── IoTGameServiceCollectionExtensions.cs
+│
+└── GameServer/                                ← DEVELOPER CODE — modify freely
+    ├── GameServer.csproj                      ← references IoTGame.Core
+    ├── Program.cs                             ← AddIoTGame() + developer choices
+    ├── appsettings.json
+    ├── Auth/
+    │   └── MyDeviceAuthenticator.cs           ← implements IDeviceAuthenticator
+    ├── Sessions/
+    │   └── MySessionStore.cs                  ← optional custom ISessionStore
+    └── Mapping/
+        └── MyPlayerMapper.cs                  ← optional custom IPlayerMapper
+```
+ 
+---
+
+## Developer Interfaces
+
+Three interfaces a developer can implement. All have sensible defaults so the
+library works out of the box without implementing any of them.
+
+### `IDeviceAuthenticator`
+
+**Question:** Is this ESP32 device trusted?
+**Called:** Before any other processing on every incoming MQTT event.
+**Default:** `AllowAllDeviceAuthenticator` — accepts everything.
+
+```csharp
+public interface IDeviceAuthenticator
+{
+    Task<bool> IsAuthenticatedAsync(string deviceId, string sessionId);
+}
+```
+
+Example implementation:
+```csharp
+public class MyDeviceAuthenticator : IDeviceAuthenticator
+{
+    public Task<bool> IsAuthenticatedAsync(string deviceId, string sessionId)
+    {
+        // Check against your own device list, database, etc.
+        var allowed = new[] { "esp32-ship-1", "esp32-ship-2", "esp32-bird-1" };
+        return Task.FromResult(allowed.Contains(deviceId));
+    }
+}
+```
+
+### `ISessionResolver`
+
+**Question:** Which Unity server should this event go to?
+**Called:** After device authentication passes.
+**Default:** `SessionStoreResolver` — reads from `ISessionStore`.
+
+```csharp
+public interface ISessionResolver
+{
+    // Returns gRPC endpoint e.g. "https://unity-server:9090"
+    // Returns null if session unknown or ended → event dropped
+    Task<string?> ResolveEndpointAsync(string sessionId);
+}
+```
+
+The default implementation reads from `ISessionStore` automatically — developers
+only implement this if they need custom resolution logic (e.g. DNS-based discovery,
+external service lookup).
+
+### `IPlayerMapper`
+
+**Question:** Which player and input name does this physical slot resolve to?
+**Called:** After session resolution.
+**Default:** `SessionStorePlayerMapper` — reads slot mappings from `ISessionStore`.
+
+```csharp
+public interface IPlayerMapper
+{
+    Task<PlayerMapping?> GetPlayerMappingAsync(
+        string deviceId, string slotId, string sessionId);
+}
+ 
+public record PlayerMapping(
+    string? PlayerId,    // null for environment/stage roles
+    string? InputName,   // null for environment roles
+    string  InputRole,   // "player", "environment", "stage"
+    string? EnvKey,      // populated for environment role
+    Dictionary<string, string>? AuxiliaryKeys
+);
+```
+
+### `IAdminAuthenticator`
+
+**Question:** Is this HTTP request authorised to call admin endpoints?
+**Called:** On every `/api/admin/*` and `/api/sessions/*` request.
+**Default:** `ApiKeyAdminAuthenticator` — validates `X-IoTGame-Key` header.
+
+```csharp
+public interface IAdminAuthenticator
+{
+    Task<bool> IsAuthorizedAsync(HttpContext context, string action);
+}
+```
+
+Default reads key from config:
+```json
+{
+  "IoTGame": {
+    "AdminApiKey": "your-secret-key-here"
+  }
+}
+```
+ 
+---
+
+## `AddIoTGame()` Fluent Builder
+
+The developer's `Program.cs` is the only place they configure the library:
+
+```csharp
+builder.Services.AddIoTGame(options =>
+{
+    options.MqttHost      = "xxxx.hivemq.cloud";
+    options.MqttPort      = 8883;
+    options.MqttUser      = Environment.GetEnvironmentVariable("MQTT_USER");
+    options.MqttPassword  = Environment.GetEnvironmentVariable("MQTT_PASS");
+    options.SharedSecret  = Environment.GetEnvironmentVariable("IOTGAME_SECRET");
+    options.BufferWindowMs = 0;
+})
+// Storage — default is InMemorySessionStore
+.WithSessionStore<InMemorySessionStore>()     // default, can omit
+// .WithSessionStore<MyCustomSessionStore>()  // developer provides persistence
+ 
+// Interfaces — all optional, defaults used if omitted
+.WithDeviceAuthenticator<MyDeviceAuthenticator>()
+.WithPlayerMapper<MyPlayerMapper>()
+.WithAdminAuthenticator<ApiKeyAdminAuthenticator>()
+ 
+// Optional features
+.WithSessionTokenAuth();  // enables token-based NGO client validation
+ 
+app.MapIoTGameEndpoints();  // registers all library endpoints
+```
+ 
+---
+
+## Session Management
+
+### Session Lifecycle
+
+```
+Created → Active → Ended
+```
+
+Sessions are created and managed via REST API or programmatically via
+`SessionManager`. Once `Active`, the session accepts MQTT events. Once `Ended`,
+events from its devices are dropped.
+
+### `ISessionStore` Interface
+
+```csharp
+public interface ISessionStore
+{
+    Task SaveAsync(GameSession session);
+    Task<GameSession?> GetAsync(string sessionId);
+    Task DeleteAsync(string sessionId);
+    Task<IEnumerable<GameSession>> GetAllActiveAsync();
+}
+```
+
+**Default:** `InMemorySessionStore` — `ConcurrentDictionary` in process memory.
+State is lost on server restart. Suitable for demos and short-lived matches.
+
+**Custom persistence:** Developer implements `ISessionStore` with SQLite, Redis,
+or any other backend. The library documents the interface contract; the
+implementation is the developer's responsibility.
+
+```csharp
+// Example — developer writes this if they need persistence
+public class SqliteSessionStore : ISessionStore
+{
+    public async Task SaveAsync(GameSession session) { ... }
+    public async Task<GameSession?> GetAsync(string sessionId) { ... }
+    public async Task DeleteAsync(string sessionId) { ... }
+    public async Task<IEnumerable<GameSession>> GetAllActiveAsync() { ... }
+}
+```
+
+### `GameSession` Model
+
+```csharp
+public class GameSession
+{
+    public string        SessionId      { get; init; }
+    public string        UnityEndpoint  { get; init; }  // gRPC endpoint
+    public SessionStatus Status         { get; set; }   // Created, Active, Ended
+    public DateTime      CreatedAt      { get; init; }
+    public DateTime?     StartedAt      { get; set; }
+    public DateTime?     EndedAt        { get; set; }
+    public List<DeviceConfig> Devices   { get; init; }
+}
+ 
+public class DeviceConfig
+{
+    public string            DeviceId { get; init; }
+    public string?           DefaultPlayerId { get; init; }
+    public List<SlotConfig>  Slots    { get; init; }
+}
+ 
+public class SlotConfig
+{
+    public string  SlotId     { get; init; }
+    public string  InputType  { get; init; }
+    public string  InputRole  { get; init; }  // "player", "environment", "stage"
+    public string? PlayerId   { get; init; }  // input-level override
+    public string? InputName  { get; init; }
+    public string? EnvKey     { get; init; }
+    public Dictionary<string, string>? AuxiliaryKeys { get; init; }
+}
+```
+
+### Session REST API
+
+```
+POST   /api/sessions                         → create session
+GET    /api/sessions                         → list all active sessions
+GET    /api/sessions/{sessionId}             → get session details + device list
+POST   /api/sessions/{sessionId}/start       → activate session
+POST   /api/sessions/{sessionId}/end         → end session
+DELETE /api/sessions/{sessionId}             → remove session entirely
+POST   /api/sessions/{sessionId}/devices     → add device to session
+DELETE /api/sessions/{sessionId}/devices/{deviceId} → remove device
+```
+
+All endpoints require `X-IoTGame-Key` header (or custom `IAdminAuthenticator`).
+
+### Session Config Delivery to Unity
+
+When a session starts, `SessionManager` calls `SendAdminCommand` with session
+metadata in the `auxiliary` map so Unity can configure itself:
+
+```csharp
+await _relay.SendAdminCommand(new AdminCommandRequest {
+    Command   = "session_start",
+    IssuedBy  = "system",
+    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+    Auxiliary = {
+        { "round_duration", 120f },
+        { "max_minions",    20f  },
+        { "player_count",   4f   }
+    }
+});
+```
+ 
+---
+
+## Authentication
+
+### ASP.NET → Unity: Shared Secret
+
+Every outgoing gRPC call includes a shared secret in the request metadata.
+Unity validates it on every incoming RPC. Both sides configure the same secret:
+
+**ASP.NET (`appsettings.json`):**
+```json
+{ "IoTGame": { "SharedSecret": "your-secret-here" } }
+```
+
+**ASP.NET sends on every RPC:**
+```csharp
+var headers = new Metadata {
+    { "x-iotgame-secret", _options.SharedSecret }
+};
+await _client.SendInputBatchAsync(request, headers);
+```
+
+If the secret does not match, Unity rejects the call with `StatusCode.Unauthenticated`.
+
+### Admin Endpoints: API Key
+
+Default `ApiKeyAdminAuthenticator` validates `X-IoTGame-Key` header on all
+`/api/admin/*` and `/api/sessions/*` endpoints:
+
+```http
+POST /api/sessions HTTP/1.1
+X-IoTGame-Key: your-secret-key
+Content-Type: application/json
+```
+
+### Optional: Session Token Flow (`WithSessionTokenAuth()`)
+
+When enabled, issues short-lived tokens for Unity game client NGO connections:
+
+```
+POST /api/sessions/{sessionId}/join
+{ "preferredPlayerId": "player-1" }    ← optional display preference, not auth
+← { "token": "tok_xK92mPqR", "expiresIn": 60 }
+ 
+Client connects to Unity NGO with token in payload:
+"spectator:tok_xK92mPqR"
+ 
+Unity validates with ASP.NET:
+GET /api/sessions/{sessionId}/validate?token=tok_xK92mPqR
+← { "valid": true }
+```
+
+Note: the token does not grant player control — all clients are spectators.
+The token only proves the client is a known participant of an active session.
+
+### HiveMQ Topic ACLs (Broker Configuration)
+
+Configure in HiveMQ Cloud dashboard — not in application code:
+
+```
+Device: esp32-ship-1
+  Allow publish:   game/devices/esp32-ship-1/#
+  Deny publish:    game/devices/#  (all other device topics)
+  Allow subscribe: (none)
+```
+
+Each device can only publish to its own topic prefix. This prevents a
+compromised device from spoofing another device's events at the broker level.
+Document this setup in the project README as part of production deployment.
+ 
+---
+
+## MQTT Event Processing Pipeline (Phase 4 Complete)
+
+```
+MQTT event arrives on game/devices/{deviceId}/slot/{slotId}
+      │
+      ▼
+IDeviceAuthenticator.IsAuthenticatedAsync(deviceId, sessionId)
+      │ false → drop + warn
+      ▼
+ISessionResolver.ResolveEndpointAsync(sessionId)
+      │ null → drop + warn
+      ▼
+IPlayerMapper.GetPlayerMappingAsync(deviceId, slotId, sessionId)
+      │ null → drop + warn
+      ▼
+Branch on InputRole:
+  "player"      → InputBufferService → SendInputBatch (with shared secret)
+  "environment" → ZoneResolverService → SendEnvironmentEvent (with shared secret)
+  "stage"       → InputBufferService with playerId="stage" → SendInputBatch
+      │
+      ▼
+UnityRelayService (keep-alive + reconnection from Phase 3.3)
+``

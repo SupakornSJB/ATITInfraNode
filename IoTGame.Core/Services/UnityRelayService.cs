@@ -1,0 +1,151 @@
+using System.Collections.Concurrent;
+using GameController.V2;
+using Grpc.Core;
+using Grpc.Net.Client;
+using IoTGame.Core.Models;
+using Microsoft.Extensions.Logging;
+
+namespace IoTGame.Core.Services;
+
+public class UnityRelayService
+{
+    private record ChannelEntry(GrpcChannel Channel, GameControllerService.GameControllerServiceClient Client);
+
+    private readonly ConcurrentDictionary<string, ChannelEntry> _pool = new();
+    private readonly string? _sharedSecret;
+    private readonly ILogger<UnityRelayService> _logger;
+
+    public UnityRelayService(IoTGameOptions options, ILogger<UnityRelayService> logger)
+    {
+        _sharedSecret = options.SharedSecret;
+        _logger = logger;
+    }
+
+    private static GrpcChannel BuildChannel(string endpoint)
+    {
+        if (endpoint.StartsWith("http://"))
+            AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
+
+        return GrpcChannel.ForAddress(endpoint, new GrpcChannelOptions
+        {
+            HttpHandler = new SocketsHttpHandler
+            {
+                KeepAlivePingDelay             = TimeSpan.FromSeconds(30),
+                KeepAlivePingTimeout           = TimeSpan.FromSeconds(10),
+                EnableMultipleHttp2Connections = true
+            }
+        });
+    }
+
+    private async Task<ChannelEntry> EnsureConnectedAsync(string endpoint)
+    {
+        var entry = _pool.GetOrAdd(endpoint, ep =>
+        {
+            var ch = BuildChannel(ep);
+            return new ChannelEntry(ch, new GameControllerService.GameControllerServiceClient(ch));
+        });
+
+        var state = entry.Channel.State;
+        if (state is ConnectivityState.TransientFailure or ConnectivityState.Shutdown)
+        {
+            _logger.LogWarning("[gRPC] Channel to {Endpoint} in {State} — rebuilding", endpoint, state);
+            await entry.Channel.ShutdownAsync();
+            var ch = BuildChannel(endpoint);
+            var newEntry = new ChannelEntry(ch, new GameControllerService.GameControllerServiceClient(ch));
+            _pool[endpoint] = newEntry;
+            return newEntry;
+        }
+        return entry;
+    }
+
+    private Metadata BuildHeaders() => _sharedSecret is not null
+        ? new Metadata { { "x-iotgame-secret", _sharedSecret } }
+        : new Metadata();
+
+    public async Task SendInputBatch(string endpoint, IEnumerable<InputEventRequest> events)
+    {
+        var entry = await EnsureConnectedAsync(endpoint);
+        try
+        {
+            var request = new InputBatchRequest();
+            request.Events.AddRange(events);
+
+            foreach (var e in request.Events)
+                _logger.LogDebug(
+                    "  → [{Seq}] player={PlayerId} device={DeviceId} input={InputName} event={EventType} value={Value}",
+                    e.SequenceNumber, e.PlayerId, e.DeviceId, e.InputName, e.EventType, e.Value);
+
+            _logger.LogInformation("Sending {Count} event(s) to Unity at {Endpoint}", request.Events.Count, endpoint);
+            var response = await entry.Client.SendInputBatchAsync(request, BuildHeaders());
+
+            if (response.Accepted)
+                _logger.LogInformation("Unity accepted {Count} event(s)", request.Events.Count);
+            else
+                _logger.LogWarning("Unity rejected batch: {Message}", response.Message);
+        }
+        catch (RpcException ex)
+        {
+            _logger.LogError("[gRPC] SendInputBatch to {Endpoint} failed: {Status}", endpoint, ex.Status);
+        }
+    }
+
+    public async Task SendEnvironmentEvent(string endpoint, EnvironmentEvent evt)
+    {
+        var entry = await EnsureConnectedAsync(endpoint);
+        try
+        {
+            var request = new EnvironmentEventRequest
+            {
+                EnvKey    = evt.EnvKey,
+                RawValue  = evt.RawValue,
+                Timestamp = evt.Timestamp
+            };
+
+            _logger.LogInformation("Sending environment event: key={EnvKey} value={Value}", evt.EnvKey, evt.RawValue);
+            var response = await entry.Client.SendEnvironmentEventAsync(request, BuildHeaders());
+
+            if (response.Accepted)
+                _logger.LogInformation("Unity accepted environment event: {EnvKey}", evt.EnvKey);
+            else
+                _logger.LogWarning("Unity rejected environment event {EnvKey}: {Message}", evt.EnvKey, response.Message);
+        }
+        catch (RpcException ex)
+        {
+            _logger.LogError("[gRPC] SendEnvironmentEvent to {Endpoint} failed: {Status}", endpoint, ex.Status);
+        }
+    }
+
+    public async Task SendAdminCommand(string endpoint, string command, string issuedBy,
+        Dictionary<string, float>? auxiliary = null)
+    {
+        var request = new AdminCommandRequest
+        {
+            Command   = command,
+            IssuedBy  = issuedBy,
+            Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+        };
+        if (auxiliary is not null)
+            foreach (var kv in auxiliary) request.Auxiliary[kv.Key] = kv.Value;
+
+        await SendAdminCommand(endpoint, request);
+    }
+
+    public async Task SendAdminCommand(string endpoint, AdminCommandRequest request)
+    {
+        var entry = await EnsureConnectedAsync(endpoint);
+        try
+        {
+            _logger.LogInformation("Sending admin command: {Command} by {IssuedBy}", request.Command, request.IssuedBy);
+            var response = await entry.Client.SendAdminCommandAsync(request, BuildHeaders());
+
+            if (response.Accepted)
+                _logger.LogInformation("Unity accepted admin command: {Command}", request.Command);
+            else
+                _logger.LogWarning("Unity rejected admin command {Command}: {Message}", request.Command, response.Message);
+        }
+        catch (RpcException ex)
+        {
+            _logger.LogError("[gRPC] SendAdminCommand to {Endpoint} failed: {Status}", endpoint, ex.Status);
+        }
+    }
+}

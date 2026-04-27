@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+option csharp_namespace = "GameController.V2";
+
+package game_controller.v2;
+
+service GameControllerService {
+  rpc SendInputEvent       (InputEventRequest)       returns (InputEventResponse);
+  rpc SendInputBatch       (InputBatchRequest)        returns (InputEventResponse);
+  rpc SendEnvironmentEvent (EnvironmentEventRequest) returns (InputEventResponse);
+  rpc SendAdminCommand     (AdminCommandRequest)     returns (AdminCommandResponse);
+}
+
+message InputEventRequest {
+  string player_id       = 1;
+  string device_id       = 2;
+  string input_name      = 3;
+  string input_type      = 4;
+  string event_type      = 5;
+  float  value           = 6;
+  int64  timestamp       = 7;
+  int64  sequence_number = 8;
+}
+
+message InputBatchRequest {
+  repeated InputEventRequest events = 1;
+}
+
+message InputEventResponse {
+  bool   accepted = 1;
+  string message  = 2;
+}
+
+message EnvironmentEventRequest {
+  string env_key    = 1;
+  float  raw_value  = 2;
+  int64  timestamp  = 3;
+}
+
+message AdminCommandRequest {
+  string             command   = 1;
+  string             issued_by = 2;
+  int64              timestamp = 3;
+  map<string, float> auxiliary = 4;
+}
+
+message AdminCommandResponse {
+  bool   accepted = 1;
+  string message  = 2;
+}
