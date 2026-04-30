@@ -71,16 +71,12 @@ public class UnityRelayService
             request.Events.AddRange(events);
 
             foreach (var e in request.Events)
-                _logger.LogDebug(
-                    "  → [{Seq}] player={PlayerId} device={DeviceId} input={InputName} event={EventType} value={Value}",
-                    e.SequenceNumber, e.PlayerId, e.DeviceId, e.InputName, e.EventType, e.Value);
-
-            _logger.LogInformation("Sending {Count} event(s) to Unity at {Endpoint}", request.Events.Count, endpoint);
+                _logger.LogInformation(
+                    "→ Unity | player={PlayerId} input={InputName} event={EventType} value={Value} (device={DeviceId} seq={Seq})",
+                    e.PlayerId, e.InputName, e.EventType, e.Value, e.DeviceId, e.SequenceNumber);
             var response = await entry.Client.SendInputBatchAsync(request, BuildHeaders());
 
-            if (response.Accepted)
-                _logger.LogInformation("Unity accepted {Count} event(s)", request.Events.Count);
-            else
+            if (!response.Accepted)
                 _logger.LogWarning("Unity rejected batch: {Message}", response.Message);
         }
         catch (RpcException ex)

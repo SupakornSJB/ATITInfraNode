@@ -35,7 +35,7 @@ public class StaticDeviceRegistryMapper : IPlayerMapper
             EnvKey: input.EnvKey,
             MinRaw: input.MinRaw,
             MaxRaw: input.MaxRaw,
-            AuxiliaryKeys: null
+            AuxiliaryKeys: input.AuxiliaryKeys
         ));
     }
 }
@@ -56,4 +56,5 @@ class InputEntry
     public float?  MaxRaw     { get; init; }
     public string  InputRole  { get; init; } = "player";
     public string? EnvKey     { get; init; }
+    public Dictionary<string, string>? AuxiliaryKeys { get; init; }
 }

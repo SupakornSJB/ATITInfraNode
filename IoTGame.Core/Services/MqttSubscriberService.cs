@@ -196,6 +196,17 @@ public class MqttSubscriberService : IHostedService
             RawValue: valueToSend,
             Timestamp: raw.Timestamp
         ));
+
+        if (mapping.AuxiliaryKeys is null || raw.Auxiliary is null) return;
+        foreach (var (payloadKey, envKey) in mapping.AuxiliaryKeys)
+        {
+            if (!raw.Auxiliary.TryGetValue(payloadKey, out var auxValue)) continue;
+            await _unityRelay.SendEnvironmentEvent(endpoint, new EnvironmentEvent(
+                EnvKey: envKey,
+                RawValue: auxValue,
+                Timestamp: raw.Timestamp
+            ));
+        }
     }
 
     private static float NormalizeValue(PlayerMapping mapping, float raw)
@@ -213,6 +224,7 @@ public class MqttSubscriberService : IHostedService
         string  Event,
         float   Value,
         long    Timestamp,
-        long    SequenceNumber
+        long    SequenceNumber,
+        Dictionary<string, float>? Auxiliary = null
     );
 }
