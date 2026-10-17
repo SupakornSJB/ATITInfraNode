@@ -1,7 +1,9 @@
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using IoTGame.Core.Abstractions;
 using IoTGame.Core.Models;
+using AlertType = IoTGame.Core.Models.AlertType;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using MQTTnet;
@@ -19,6 +21,7 @@ public class MqttSubscriberService : IHostedService
     private readonly InputBufferService _inputBuffer;
     private readonly UnityRelayService _unityRelay;
     private readonly ZoneResolverService _zoneResolver;
+    private readonly IIntrusionDetector _ids;
     private readonly ILogger<MqttSubscriberService> _logger;
 
     public MqttSubscriberService(
@@ -29,6 +32,7 @@ public class MqttSubscriberService : IHostedService
         InputBufferService inputBuffer,
         UnityRelayService unityRelay,
         ZoneResolverService zoneResolver,
+        IIntrusionDetector ids,
         ILogger<MqttSubscriberService> logger)
     {
         _options = options;
@@ -38,6 +42,7 @@ public class MqttSubscriberService : IHostedService
         _inputBuffer = inputBuffer;
         _unityRelay = unityRelay;
         _zoneResolver = zoneResolver;
+        _ids = ids;
         _logger = logger;
         _mqttClient = new MqttFactory().CreateMqttClient();
     }
@@ -50,8 +55,36 @@ public class MqttSubscriberService : IHostedService
             .WithTcpServer(_options.MqttHost, _options.MqttPort)
             .WithCredentials(_options.MqttUser, _options.MqttPassword);
 
-        if (_options.MqttPort == 8883)
-            optionsBuilder = optionsBuilder.WithTlsOptions(o => o.UseTls());
+        if (_options.MqttUseTls || _options.MqttPort == 8883)
+        {
+            optionsBuilder = optionsBuilder.WithTlsOptions(o =>
+            {
+                o.UseTls();
+
+                if (!string.IsNullOrEmpty(_options.MqttCaFile))
+                {
+                    var caCert = new X509Certificate2(_options.MqttCaFile);
+                    o.WithCertificateValidationHandler(ctx =>
+                    {
+                        var chain = new X509Chain();
+                        chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                        chain.ChainPolicy.CustomTrustStore.Add(caCert);
+                        chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                        return chain.Build(new X509Certificate2(ctx.Certificate));
+                    });
+                }
+
+                if (!string.IsNullOrEmpty(_options.MqttClientCertFile) &&
+                    !string.IsNullOrEmpty(_options.MqttClientKeyFile))
+                {
+                    var pemCert = X509Certificate2.CreateFromPemFile(
+                        _options.MqttClientCertFile, _options.MqttClientKeyFile);
+                    // Re-import via PKCS12 so Windows SChannel can access the private key
+                    var clientCert = new X509Certificate2(pemCert.Export(X509ContentType.Pkcs12));
+                    o.WithClientCertificates(new List<X509Certificate2> { clientCert });
+                }
+            });
+        }
 
         _mqttClient.ApplicationMessageReceivedAsync += OnMessageReceived;
 
@@ -74,6 +107,8 @@ public class MqttSubscriberService : IHostedService
     private async Task OnMessageReceived(MqttApplicationMessageReceivedEventArgs e)
     {
         var topic = e.ApplicationMessage.Topic;
+        _logger.LogInformation("[MQTT] Message received on topic: {Topic}", topic);
+
         var segments = topic.Split('/');
 
         // Expected: game/devices/{deviceId}/slot/{slotId}
@@ -86,6 +121,7 @@ public class MqttSubscriberService : IHostedService
         var deviceId = segments[2];
         var slotId   = segments[4];
         var payload  = Encoding.UTF8.GetString(e.ApplicationMessage.PayloadSegment);
+        _logger.LogInformation("[MQTT] device={DeviceId} slot={SlotId} payload={Payload}", deviceId, slotId, payload);
 
         RawSlotPayload? raw;
         try
@@ -105,32 +141,81 @@ public class MqttSubscriberService : IHostedService
             return;
         }
 
-        // 1. Resolve which session owns this device (server's responsibility, not firmware's)
+        // 1. Check quarantine before any processing
+        if (_ids.IsQuarantined(deviceId))
+        {
+            _logger.LogWarning("[IDS] Device {DeviceId} is quarantined — dropping event on slot {SlotId}", deviceId, slotId);
+            return;
+        }
+
+        // 2. Resolve which session owns this device
         var context = await _sessionResolver.ResolveAsync(deviceId);
         if (context is null)
         {
             _logger.LogWarning("No active session found for device {DeviceId} — dropping", deviceId);
+            await _ids.ReportAsync(new IntrusionAlert
+            {
+                DeviceId  = deviceId,
+                AlertType = AlertType.UnknownDevice,
+                Detail    = $"No active session for device {deviceId}",
+                Timestamp = DateTimeOffset.UtcNow
+            });
             return;
         }
 
-        // 2. Authenticate device against resolved session
+        // 3. Authenticate device against resolved session
         if (!await _deviceAuth.IsAuthenticatedAsync(deviceId, context.SessionId))
         {
             _logger.LogWarning("Device {DeviceId} not authenticated for session {SessionId} — dropping", deviceId, context.SessionId);
+            await _ids.ReportAsync(new IntrusionAlert
+            {
+                DeviceId         = deviceId,
+                AlertType        = AlertType.UnauthorizedDevice,
+                Detail           = $"Auth failed for session {context.SessionId}",
+                Timestamp        = DateTimeOffset.UtcNow,
+                ShouldQuarantine = true
+            });
             return;
         }
 
-        // 3. Map device/slot to player
+        // Record device as seen and get current rate
+        var rate = await _ids.TrackDeviceAsync(deviceId, raw.SequenceNumber);
+        if (_options.MaxEventsPerSecond > 0 && rate > _options.MaxEventsPerSecond)
+        {
+            _logger.LogWarning("[IDS] Rate {Rate:F0}/s exceeds limit {Limit}/s for {DeviceId} — quarantining",
+                rate, _options.MaxEventsPerSecond, deviceId);
+            await _ids.ReportAsync(new IntrusionAlert
+            {
+                DeviceId         = deviceId,
+                AlertType        = AlertType.RateExceeded,
+                Detail           = $"Rate {rate:F0}/s exceeds limit of {_options.MaxEventsPerSecond}/s",
+                Timestamp        = DateTimeOffset.UtcNow,
+                ShouldQuarantine = true
+            });
+            return;
+        }
+
+        // 4. Map device/slot to player
         var mapping = await _playerMapper.GetPlayerMappingAsync(deviceId, slotId, context.SessionId);
         if (mapping is null)
         {
             _logger.LogWarning("No mapping for {DeviceId}/{SlotId} in session {SessionId} — dropping", deviceId, slotId, context.SessionId);
+            await _ids.ReportAsync(new IntrusionAlert
+            {
+                DeviceId  = deviceId,
+                AlertType = AlertType.UnknownSlot,
+                Detail    = $"Unknown slot '{slotId}' on device {deviceId}",
+                Timestamp = DateTimeOffset.UtcNow
+            });
             return;
         }
 
         var endpoint = context.Endpoint;
 
-        // 4. Route by inputRole
+        _logger.LogInformation("[MQTT] Routing device={DeviceId} slot={SlotId} role={Role} inputName={InputName}",
+            deviceId, slotId, mapping.InputRole, mapping.InputName);
+
+        // 5. Route by inputRole
         switch (mapping.InputRole)
         {
             case "environment":

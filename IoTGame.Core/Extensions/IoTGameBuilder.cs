@@ -11,6 +11,12 @@ public class IoTGameBuilder
 
     internal IoTGameBuilder(IServiceCollection services) => Services = services;
 
+    public IoTGameBuilder WithIntrusionDetector<TDetector>() where TDetector : class, IIntrusionDetector
+    {
+        Services.AddSingleton<IIntrusionDetector, TDetector>();
+        return this;
+    }
+
     public IoTGameBuilder WithSessionStore<TStore>() where TStore : class, ISessionStore
     {
         Services.AddSingleton<ISessionStore, TStore>();

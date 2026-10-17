@@ -22,6 +22,7 @@ public static class IoTGameServiceCollectionExtensions
         services.AddSingleton<UnityRelayService>();
         services.AddSingleton<ZoneResolverService>();
         services.AddSingleton<InputBufferService>();
+        services.AddSingleton<GameStateService>();
         services.AddHostedService<InputBufferService>(sp => sp.GetRequiredService<InputBufferService>());
         services.AddHostedService<MqttSubscriberService>();
         services.AddSingleton<SessionManager>();
@@ -32,6 +33,7 @@ public static class IoTGameServiceCollectionExtensions
         services.AddSingleton<IAdminAuthenticator, ApiKeyAdminAuthenticator>();
         services.AddSingleton<ISessionResolver, SessionStoreResolver>();
         services.AddSingleton<IPlayerMapper, SessionStorePlayerMapper>();
+        services.AddSingleton<IIntrusionDetector, NoOpIntrusionDetector>();
 
         // Null token service fallback so endpoints don't throw when token auth is disabled
         services.AddSingleton<SessionTokenService>();
