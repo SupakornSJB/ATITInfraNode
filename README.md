@@ -174,7 +174,8 @@ Key settings in `appsettings.json`:
 | `IoTGame:BufferWindowMs` | `0` = forward immediately; `>0` = batch window in ms |
 | `IoTGame:MaxEventsPerSecond` | Per-device rate limit (default `60`) |
 
-The admin dashboard is a separate React app. In development it runs on Vite and proxies to
+The [admin dashboard](https://github.com/SupakornSJB/atit-dashboard) is a separate React app.
+In development it runs on Vite and proxies to
 this server; a production build copied into `GameServer/wwwroot/dashboard/` is served at
 `/dashboard`.
 
