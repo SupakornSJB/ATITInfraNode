@@ -1,159 +1,191 @@
-# ATITInfraNode
+# ATITInfraNode — IoT Relay Server
 
-ASP.NET Core server that acts as the central hub in an IoT-powered physical game controller system. It bridges ESP32 button devices (over MQTT) and a Unity dedicated game server (over gRPC), handling device-to-player identity mapping and protocol translation.
-
-## System Architecture
-
-```
-[ESP32 #1]  ──┐
-[ESP32 #2]  ──┤  MQTT (plain TCP or TLS)
-[ESP32 #N]  ──┘  topic: game/devices/{deviceId}/slot/{slotId}
-                  broker: HiveMQ Cloud or local
-                        │
-                        ▼
-              [ATITInfraNode]               ← this project
-                - Resolves (deviceId, slotId) → (playerId, inputName)
-                - Normalizes raw sensor values
-                - Forwards to Unity over gRPC
-                        │
-                        │  gRPC (HTTP/2 + Protobuf)
-                        ▼
-              [Unity Dedicated Server]
-                - Receives resolved input events
-                - Runs game logic via Netcode for GameObjects
-```
-
-## What It Does
-
-1. Subscribes to `game/devices/+/slot/+` — one wildcard catches all devices and slots
-2. On each MQTT message, looks up `(deviceId, slotId)` in the device registry to resolve `playerId` and `inputName`
-3. Normalizes raw ADC values (e.g. knobs) to `0.0–1.0`
-4. Forwards the resolved event to Unity via gRPC `SendInputBatch`
-5. Applies per-slot rate limiting (default 60 events/sec) to protect against sensor floods
-6. Exposes `GET /health` for deployment readiness probes
-
-Unity only ever receives `{ playerId, inputName, value, ... }` — it never sees physical device topology.
-
-## Tech Stack
-
-- .NET 10 / ASP.NET Core (minimal API)
-- [MQTTnet](https://github.com/dotnet/MQTTnet) v4
-- gRPC via `Grpc.Net.Client` + `Grpc.Tools` + `Google.Protobuf`
-
-## Project Structure
+ASP.NET Core (.NET 8) server at the center of
+[ATITFinalProject](https://github.com/SupakornSJB/ATITFinalProject). It subscribes to
+ESP32 controller events over **MQTT with mutual TLS**, works out which player and action each
+physical slot belongs to, and forwards clean game events to the Unity dedicated server over
+**gRPC with mutual TLS**. It also runs intrusion detection and the backend for the admin
+security dashboard.
 
 ```
-ATITInfraNode/
-├── Proto/
-│   └── game_controller_v2.proto     # gRPC contract shared with Unity
-├── Services/
-│   ├── MqttSubscriberService.cs     # IHostedService — MQTT listener
-│   ├── DeviceRegistryService.cs     # (deviceId, slotId) → (playerId, inputName)
-│   ├── InputBufferService.cs        # Optional batching + rate limiting
-│   └── UnityRelayService.cs         # gRPC client
-├── Models/
-│   ├── InputEvent.cs                # Resolved internal event DTO
-│   └── DeviceRegistryConfig.cs      # Typed config models
-├── Program.cs
-├── appsettings.json
-└── appsettings.Development.json
+ESP32s ──MQTT/mTLS──▶ Mosquitto ──▶ GameServer (this repo) ──gRPC/mTLS──▶ Unity server
+                                        │
+                                        └── REST + SignalR ──▶ admin dashboard
 ```
 
-## Setup
+---
 
-### 1. Install dependencies
+## What it does
 
-```bash
-dotnet restore
-```
+For every message on `game/devices/+/slot/+`:
 
-### 2. Set MQTT credentials (dev)
+1. **Quarantine check** — events from quarantined devices are dropped
+2. **Session resolution** — finds the Unity server that owns the device
+3. **Device authentication** — pluggable `IDeviceAuthenticator` (identity itself is enforced
+   by the broker's certificate check)
+4. **Rate limiting** — per-device events/second above `IoTGame:MaxEventsPerSecond` raise an
+   alert and quarantine the device
+5. **Mapping** — looks up `(deviceId, slotId)` in the `DeviceRegistry`; unknown slots raise an
+   alert and are dropped
+6. **Routing by role:**
+   - `player` → buffered `InputEvent` for that player (`move-x`, `fire`, …) → `SendInputBatch`
+   - `stage` → forwarded as `stage` input; Unity turns `admin-start` / `admin-end` into
+     round start / end
+   - `environment` → `SendEnvironmentEvent`; ultrasonic distance goes through
+     `ZoneResolverService`, which applies hysteresis and only emits zone 1–4 changes;
+     `auxiliaryKeys` fan out extra sensor values (e.g. DHT11 humidity → `spawn_rate`)
 
-```bash
-cd ATITInfraNode
-dotnet user-secrets set "Mqtt:Username" "your-hivemq-username"
-dotnet user-secrets set "Mqtt:Password" "your-hivemq-password"
-```
+Unity only ever receives `playerId` + semantic `inputName` or `envKey` — it never sees
+device ids, slots or raw sensor names.
 
-### 3. Configure `appsettings.json`
+---
 
-| Key | Description |
+## Projects
+
+| Project | Role |
 |---|---|
-| `Mqtt:Host` | MQTT broker hostname (e.g. `abc123.s1.eu.hivemq.cloud` or local IP) |
-| `Mqtt:Port` | `1883` for plain TCP, `8883` for TLS |
-| `Unity:GrpcEndpoint` | Unity server address (e.g. `http://192.168.1.50:9090`) |
-| `IoTGame:BufferWindowMs` | `0` = forward immediately; `>0` = batch window in ms |
-| `IoTGame:MaxEventsPerSecond` | Per-slot rate limit (default `60`) |
+| `IoTGame.Core/` | **Library** — MQTT subscriber, input buffer + rate limiter, zone resolver, gRPC relay, session manager, admin/session endpoints, and the extension interfaces |
+| `GameServer/` | **This game's app** — wires the library with game-specific implementations, the device registry, JWT auth, the security API and SignalR hub |
 
-### 4. Configure the device registry
+`IoTGame.Core` is game-agnostic. A game plugs in its own behaviour through the builder in
+`GameServer/Program.cs`:
 
-The registry maps physical hardware slots to player IDs and semantic input names. Keys under `"inputs"` are `slotId` values (matching what the firmware publishes); `inputName` is what Unity receives.
+```csharp
+builder.Services.AddIoTGame(options => { /* from configuration */ })
+    .WithSessionStore<InMemorySessionStore>()
+    .WithDeviceAuthenticator<AllowAllDeviceAuthenticator>()
+    .WithAdminAuthenticator<ApiKeyAdminAuthenticator>()
+    .WithPlayerMapper<StaticDeviceRegistryMapper>()     // DeviceRegistry → players
+    .WithSessionResolver<StaticSessionResolver>()        // single Unity endpoint
+    .WithIntrusionDetector<RuleBasedIntrusionDetector>() // alerts + quarantine + SignalR
+    .WithSessionTokenAuth();
+```
+
+```
+IoTGame.Core/
+├── Abstractions/   IDeviceAuthenticator, IPlayerMapper, ISessionResolver, ISessionStore,
+│                   IAdminAuthenticator, IIntrusionDetector
+├── Services/       MqttSubscriberService, InputBufferService, ZoneResolverService,
+│                   UnityRelayService, SessionManager, GameStateService
+├── Endpoints/      /health, /api/admin/*, /api/sessions/*
+├── Auth/ Storage/ Models/ Extensions/
+└── Proto/          game_controller_v2.proto — gRPC contract shared with Unity
+GameServer/
+├── Program.cs      Composition root, JWT, CORS (dev), static dashboard hosting
+├── Mapping/        StaticDeviceRegistryMapper, StaticSessionResolver
+├── Security/       RuleBasedIntrusionDetector
+├── Controllers/    AuthController (/api/auth), SecurityController (/api/security)
+├── Hubs/           SecurityHub (/hubs/security)
+├── Data/           EF Core + SQLite dashboard users
+└── Scripts/        seed_admin.py, rogue_device.py
+```
+
+---
+
+## API
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /health` | — | Readiness probe |
+| `POST /api/auth/login` | — | Dashboard login → JWT |
+| `GET /api/security/status`, `/devices`, `/alerts` | JWT | Device security state and alert history |
+| `PUT /api/security/devices/{id}/quarantine?quarantine=true\|false` | JWT | Manually quarantine / release a device |
+| `POST /api/security/alerts/clear` | JWT | Clear the alert list |
+| `POST /api/admin/start`, `/end`, `/reset` | Admin API key¹ | Round control on the Unity server |
+| `/api/sessions/*` | Admin API key¹ | Create / start / end sessions, assign devices, issue join tokens |
+| SignalR `/hubs/security` | JWT | Pushes `OnAlert` and `OnDeviceStateChanged` in real time |
+
+¹ `X-IoTGame-Key` header, checked against `IoTGame:AdminApiKey`. If the key is empty these
+endpoints are open — see [Known limitations](#known-limitations).
+
+---
+
+## Intrusion detection
+
+`RuleBasedIntrusionDetector` tracks every device and raises alerts that are logged, kept (last
+500) and broadcast to the dashboard:
+
+| Alert | Trigger | Quarantines |
+|---|---|---|
+| `RateExceeded` | More events/second than `MaxEventsPerSecond` | Yes |
+| `UnauthorizedDevice` | Device authenticator rejects the device | Yes |
+| `UnknownSlot` | Slot not in the device's registry entry | No |
+| `UnknownDevice` | No session for the device | No |
+| `ManualQuarantine` | Operator clicks *Quarantine* in the dashboard | Yes |
+
+`Scripts/rogue_device.py` reproduces the attacks for a demo
+(`python rogue_device.py no-cert | flood | spoof-slot --broker <host>`).
+
+---
+
+## Device registry
+
+`GameServer/appsettings.json` maps physical slots to meaning — remapping a controller is a
+config change, not a firmware or Unity change:
 
 ```json
 "DeviceRegistry": {
-  "players": {
-    "player-1": ["esp32-01"],
-    "player-2": ["esp32-shared"],
-    "player-3": ["esp32-shared"]
-  },
+  "players": { "player-1": ["esp32-01"], "player-2": ["esp32-02"] },
   "devices": {
     "esp32-01": {
       "defaultPlayerId": "player-1",
       "inputs": {
-        "btn1":  { "type": "button", "inputName": "jump" },
-        "knob1": { "type": "knob",   "inputName": "speed", "minRaw": 0, "maxRaw": 4095 }
-      }
-    },
-    "esp32-shared": {
-      "defaultPlayerId": null,
-      "inputs": {
-        "btn1": { "type": "button", "inputName": "jump", "playerId": "player-2" },
-        "btn2": { "type": "button", "inputName": "jump", "playerId": "player-3" }
+        "joystick-x": { "type": "knob",       "inputName": "move-x",      "inputRole": "player" },
+        "btn-1":      { "type": "button",     "inputName": "admin-start", "inputRole": "stage" },
+        "dht11":      { "type": "dht11",      "inputRole": "environment", "envKey": "unused",
+                        "auxiliaryKeys": { "humidity": "spawn_rate" } },
+        "distance":   { "type": "ultrasonic", "inputRole": "environment", "envKey": "ultrasonic_zone" }
       }
     }
   }
 }
 ```
 
-`minRaw`/`maxRaw` on knob inputs cause the server to normalize raw ADC values to `0.0–1.0` before forwarding to Unity.
+Optional per-slot fields: `playerId` (overrides `defaultPlayerId`) and `minRaw` / `maxRaw`
+(normalize a raw value to 0.0–1.0; the firmware already normalizes knobs).
 
-**Player resolution priority per slot:**
-1. Slot-level `playerId` override
-2. Device `defaultPlayerId`
-3. Neither set → event is dropped with a warning
+---
 
-## MQTT Message Format (from firmware)
+## Running
 
-Topic: `game/devices/{deviceId}/slot/{slotId}`
-
-```json
-{
-  "deviceId": "esp32-01",
-  "slotId": "btn1",
-  "inputType": "button",
-  "event": "pressed",
-  "value": 1.0,
-  "timestamp": 1234567890,
-  "sequenceNumber": 42
-}
-```
-
-## Running Locally
+Certificates, broker setup and secrets are covered step by step in the
+[setup guide](https://github.com/SupakornSJB/ATITFinalProject/blob/main/docs/setup.md).
+In short:
 
 ```bash
-dotnet run --project ATITInfraNode
+cd GameServer
+# copy ca.crt, device.crt, device.key (CN=gameserver) into Certs/
+dotnet user-secrets set "Dashboard:JwtSecret" "$(openssl rand -base64 48)"
+dotnet run                                        # https://localhost:5000
+python Scripts/seed_admin.py "<admin-password>"   # once, creates the dashboard login
 ```
 
-Check health: `curl http://localhost:5025/health`
+The server refuses to start without a `Dashboard:JwtSecret` of at least 32 bytes. Outside
+Development, supply secrets as environment variables (`Dashboard__JwtSecret`,
+`IoTGame__AdminApiKey`, …).
 
-## Production Environment Variables
+Key settings in `appsettings.json`:
 
-Use double-underscore (`__`) as the .NET config delimiter:
+| Key | Meaning |
+|---|---|
+| `Mqtt:Host`, `Mqtt:Port`, `Mqtt:UseTls` | Broker connection |
+| `Mqtt:CaFile`, `Mqtt:ClientCertFile`, `Mqtt:ClientKeyFile` | Broker mTLS (paths relative to `GameServer/`) |
+| `Unity:GrpcEndpoint`, `Unity:GrpcClientCertFile`, `Unity:GrpcClientKeyFile` | Unity gRPC server and the client cert presented to it |
+| `IoTGame:BufferWindowMs` | `0` = forward immediately; `>0` = batch window in ms |
+| `IoTGame:MaxEventsPerSecond` | Per-device rate limit (default `60`) |
 
-```bash
-Mqtt__Host=abc123.s1.eu.hivemq.cloud
-Mqtt__Port=8883
-Mqtt__Username=your-user
-Mqtt__Password=your-password
-Unity__GrpcEndpoint=https://unity-server:9090
-```
+The admin dashboard is a separate React app. In development it runs on Vite and proxies to
+this server; a production build copied into `GameServer/wwwroot/dashboard/` is served at
+`/dashboard`.
+
+---
+
+## Known limitations
+
+- **Admin endpoints vs. dashboard:** `/api/admin/*` accepts only the API key. With
+  `AdminApiKey` empty they are open to anyone; with it set, the dashboard's Start/End buttons
+  (which send a JWT) are rejected. Accepting either credential would fix both.
+- **Unity server certificate is not verified:** the gRPC client presents its own certificate
+  but accepts any server certificate (`UnityRelayService`).
+- `AllowAllDeviceAuthenticator` and `StaticSessionResolver` are single-game defaults; the
+  interfaces exist to replace them.
