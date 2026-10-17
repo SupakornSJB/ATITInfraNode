@@ -23,7 +23,7 @@ dashboard.db
 dashboard.db-shm
 dashboard.db-wal
 
-# Phase 6: Built React SPA — populated by deploy-dashboard.sh, not committed
+# Optional production build of the admin dashboard (see ATITFinalProject/docs/setup.md)
 GameServer/wwwroot/dashboard/
 
 # OS

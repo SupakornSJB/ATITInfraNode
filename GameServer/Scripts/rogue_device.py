@@ -9,7 +9,7 @@ Usage:
   python rogue_device.py spoof-slot           # Attack 3: publish unknown slotId (alert only)
 
 Options:
-  --broker  MQTT broker host  (default: 172.20.10.13)
+  --broker  MQTT broker host  (default: localhost)
   --port    MQTT broker port  (default: 1883)
   --ca      CA cert path      (default: ../Certs/ca.crt)
   --cert    Rogue device cert (default: ../Certs/device.crt)
@@ -174,7 +174,7 @@ def _apply_tls(client, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IoTGame rogue device attack simulator")
     parser.add_argument("attack", choices=["no-cert", "flood", "spoof-slot", "spoof-device"])
-    parser.add_argument("--broker", default="172.20.10.13")
+    parser.add_argument("--broker", default="localhost")
     parser.add_argument("--port",   type=int, default=1883)
     parser.add_argument("--ca",     default="../Certs/ca.crt")
     parser.add_argument("--cert",   default="../Certs/esp32-02/device.crt")
