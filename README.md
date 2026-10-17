@@ -35,8 +35,8 @@ For every message on `game/devices/+/slot/+`:
      `ZoneResolverService`, which applies hysteresis and only emits zone 1–4 changes;
      `auxiliaryKeys` fan out extra sensor values (e.g. DHT11 humidity → `spawn_rate`)
 
-Unity only ever receives `playerId` + semantic `inputName` or `envKey` — it never sees
-device ids, slots or raw sensor names.
+Unity receives `playerId` + a semantic `inputName` or `envKey`; the device id is passed along
+for diagnostics only, and slot ids and raw sensor names never reach it.
 
 ---
 
@@ -90,6 +90,7 @@ GameServer/
 | `POST /api/auth/login` | — | Dashboard login → JWT |
 | `GET /api/security/status`, `/devices`, `/alerts` | JWT | Device security state and alert history |
 | `PUT /api/security/devices/{id}/quarantine?quarantine=true\|false` | JWT | Manually quarantine / release a device |
+| `POST /api/security/devices/{id}/quarantine`, `/unquarantine` | JWT | Same, as separate actions |
 | `POST /api/security/alerts/clear` | JWT | Clear the alert list |
 | `POST /api/admin/start`, `/end`, `/reset` | Admin API key¹ | Round control on the Unity server |
 | `/api/sessions/*` | Admin API key¹ | Create / start / end sessions, assign devices, issue join tokens |
@@ -113,8 +114,8 @@ endpoints are open — see [Known limitations](#known-limitations).
 | `UnknownDevice` | No session for the device | No |
 | `ManualQuarantine` | Operator clicks *Quarantine* in the dashboard | Yes |
 
-`Scripts/rogue_device.py` reproduces the attacks for a demo
-(`python rogue_device.py no-cert | flood | spoof-slot --broker <host>`).
+`Scripts/rogue_device.py` is a demo attacker (`no-cert`, `flood`, `spoof-slot`, `spoof-device`);
+see [Known limitations](#known-limitations) — it has not been re-tested since Phase 6.
 
 ---
 
@@ -125,7 +126,6 @@ config change, not a firmware or Unity change:
 
 ```json
 "DeviceRegistry": {
-  "players": { "player-1": ["esp32-01"], "player-2": ["esp32-02"] },
   "devices": {
     "esp32-01": {
       "defaultPlayerId": "player-1",
@@ -186,7 +186,21 @@ this server; a production build copied into `GameServer/wwwroot/dashboard/` is s
 - **Admin endpoints vs. dashboard:** `/api/admin/*` accepts only the API key. With
   `AdminApiKey` empty they are open to anyone; with it set, the dashboard's Start/End buttons
   (which send a JWT) are rejected. Accepting either credential would fix both.
-- **Unity server certificate is not verified:** the gRPC client presents its own certificate
-  but accepts any server certificate (`UnityRelayService`).
+- **Unity server certificate check depends on the endpoint** (`UnityRelayService`): for
+  `https://localhost` / `https://127.*` the relay accepts any server certificate. For any other
+  host it uses the operating system's trust store and hostname check, so a Unity certificate
+  signed by the project CA is rejected unless `ca.crt` is installed as a trusted root and the
+  certificate's name matches the host in `Unity:GrpcEndpoint`. Running the relay and Unity on
+  the same machine avoids this.
+- **`rogue_device.py` is untested since Phase 6:** `spoof-slot` publishes to a literal
+  `{device_id}` topic (missing f-string), so the broker ACL drops it and no alert fires; its
+  defaults (port 1883, `../Certs/esp32-02/…`) don't match the setup guide, and it reports
+  success even when the client certificate wasn't loaded.
 - `AllowAllDeviceAuthenticator` and `StaticSessionResolver` are single-game defaults; the
   interfaces exist to replace them.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
