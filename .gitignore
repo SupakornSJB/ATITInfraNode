@@ -37,6 +37,7 @@ Thumbs.db
 *.pfx
 *.p12
 
-# Per-deployment certs — see ATITFinalProject/docs/SETUP.md. Only the public CA is committed.
+# Per-deployment certs — see ATITFinalProject/docs/setup.md. None are committed;
+# .gitkeep only keeps the folder so the setup copy step works on a fresh clone.
 GameServer/Certs/*
-!GameServer/Certs/ca.crt
+!GameServer/Certs/.gitkeep
