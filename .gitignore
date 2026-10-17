@@ -18,6 +18,25 @@ secrets.json
 .env
 .env.*
 
+# Phase 6: SQLite dashboard database
+dashboard.db
+dashboard.db-shm
+dashboard.db-wal
+
+# Phase 6: Built React SPA — populated by deploy-dashboard.sh, not committed
+GameServer/wwwroot/dashboard/
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Private keys / CSRs — never commit. ca.crt and device.crt are public and fine.
+*.key
+*.csr
+*.srl
+*.pfx
+*.p12
+
+# Per-deployment certs — see ATITFinalProject/docs/SETUP.md. Only the public CA is committed.
+GameServer/Certs/*
+!GameServer/Certs/ca.crt
