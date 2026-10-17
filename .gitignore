@@ -30,7 +30,7 @@ GameServer/wwwroot/dashboard/
 .DS_Store
 Thumbs.db
 
-# Private keys / CSRs — never commit. ca.crt and device.crt are public and fine.
+# Private keys / CSRs — never commit
 *.key
 *.csr
 *.srl

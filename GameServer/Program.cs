@@ -37,7 +37,6 @@ builder.Services.AddIoTGame(options =>
     options.MqttPort           = builder.Configuration.GetValue<int>("Mqtt:Port", 8883);
     options.MqttUser           = builder.Configuration["Mqtt:Username"];
     options.MqttPassword       = builder.Configuration["Mqtt:Password"];
-    options.SharedSecret       = builder.Configuration["IoTGame:SharedSecret"];
     options.BufferWindowMs     = builder.Configuration.GetValue<int>("IoTGame:BufferWindowMs", 0);
     options.MaxEventsPerSecond = builder.Configuration.GetValue<int>("IoTGame:MaxEventsPerSecond", 60);
     options.AdminApiKey         = builder.Configuration["IoTGame:AdminApiKey"];

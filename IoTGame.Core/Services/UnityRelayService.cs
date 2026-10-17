@@ -14,7 +14,6 @@ public class UnityRelayService
 
     private readonly ConcurrentDictionary<string, ChannelEntry> _pool = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new();
-    private readonly string? _sharedSecret;
     private readonly ILogger<UnityRelayService> _logger;
 
     private readonly string? _grpcClientCertFile;
@@ -22,7 +21,6 @@ public class UnityRelayService
 
     public UnityRelayService(IoTGameOptions options, ILogger<UnityRelayService> logger)
     {
-        _sharedSecret       = options.SharedSecret;
         _grpcClientCertFile = options.GrpcClientCertFile;
         _grpcClientKeyFile  = options.GrpcClientKeyFile;
         _logger = logger;
@@ -125,12 +123,7 @@ public class UnityRelayService
         }
     }
 
-    private Metadata BuildHeaders() => _sharedSecret is not null
-        ? new Metadata { { "x-iotgame-secret", _sharedSecret } }
-        : new Metadata();
-
     private CallOptions DeadlinedHeaders() => new(
-        headers:  BuildHeaders(),
         deadline: DateTime.UtcNow.AddSeconds(5));
 
     public async Task SendInputBatch(string endpoint, IEnumerable<InputEventRequest> events)
