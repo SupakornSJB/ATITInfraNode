@@ -2,13 +2,14 @@
 
 ## Update Logs
 
-Daily logs of problems encountered and solutions applied are in the `updates/` folder.
+Daily logs of problems encountered and solutions applied are in the `docs/logs/` folder.
 Read the relevant date file for context on recent changes before diving into code.
 
-- [2026-04-24](updates/2026-04-24.md) — MQTT TLS/port mismatch crash on startup
-- [2026-04-25](updates/2026-04-25.md) — Phase 2 (multi-input/device/player), gRPC SSL fix, logging, Phase 2.1 slot/inputName separation
-- [2026-04-27](updates/2026-04-27.md) — Phase 3 (environment routing, zone logic, admin commands), Phase 3.1 (auxiliary multi-output sensors), Phase 3.2 (swap gravity/spawn_rate effects)
-- [2026-04-27](updates/2026-04-27.md) — Phase 3.3 gRPC keep-alive/reconnection, Phase 4 library foundation (IoTGame.Core + GameServer)
+- [2026-04-24](docs/logs/2026-04-24.md) — MQTT TLS/port mismatch crash on startup
+- [2026-04-25](docs/logs/2026-04-25.md) — Phase 2 (multi-input/device/player), gRPC SSL fix, logging, Phase 2.1 slot/inputName separation
+- [2026-04-27](docs/logs/2026-04-27.md) — Phase 3 (environment routing, zone logic, admin commands), Phase 3.1 (auxiliary multi-output sensors), Phase 3.2 (swap gravity/spawn_rate effects)
+- [2026-04-27](docs/logs/2026-04-27.md) — Phase 3.3 gRPC keep-alive/reconnection, Phase 4 library foundation (IoTGame.Core + GameServer)
+- [2026-05-06](docs/logs/2026-05-06.md) — Phase 6 security dashboard backend (SignalR, JWT, SQLite/bcrypt) and mutual TLS firmware authentication (ESP32 client certs)
 
 ## What This Project Is
 
